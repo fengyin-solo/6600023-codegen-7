@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.routers import ecg_router
+from app.routers import ecg_router, report_router
 
 app = FastAPI(
     title="ECG Monitoring System API",
@@ -18,6 +18,7 @@ app.add_middleware(
 )
 
 app.include_router(ecg_router.router, prefix="/ecg", tags=["ECG"])
+app.include_router(report_router.router, prefix="/api", tags=["Report"])
 
 
 @app.get("/health")

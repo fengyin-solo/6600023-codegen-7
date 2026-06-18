@@ -1,6 +1,10 @@
 import { defineStore } from 'pinia';
 import { ref, computed } from 'vue';
-import type { ECGLead, HRVData, RPeak, ArrhythmiaEvent, ECGAnalysisResponse } from '../types';
+import type { 
+  ECGLead, HRVData, RPeak, ArrhythmiaEvent, ECGAnalysisResponse,
+  AnalysisReport, ReportFormat, ReportExportResponse, WaveformSnapshot,
+  ReportSummary,
+} from '../types';
 
 // Gaussian function for PQRST wave simulation
 function gaussian(x: number, amplitude: number, center: number, width: number): number {
@@ -61,10 +65,20 @@ export const useECGStore = defineStore('ecg', () => {
   let animationTimer: ReturnType<typeof setInterval> | null = null;
   let scrollOffset = ref<number>(0);
 
+  // Report state
+  const currentReport = ref<AnalysisReport | null>(null);
+  const reportExportFormat = ref<ReportFormat>('html');
+  const includeSnapshots = ref<boolean>(true);
+  const snapshotCount = ref<number>(3);
+  const patientId = ref<string>('');
+  const isGeneratingReport = ref<boolean>(false);
+  const isExportingReport = ref<boolean>(false);
+
   // Getters
   const currentSamples = computed(() => ecgData.value?.samples ?? []);
   const currentRPeaks = computed(() => ecgData.value?.rPeaks ?? []);
   const currentHeartRate = computed(() => hrvData.value?.heartRate ?? heartRate.value);
+  const hasAnalysisData = computed(() => ecgData.value !== null && hrvData.value !== null);
 
   // Actions
 
@@ -380,6 +394,560 @@ export const useECGStore = defineStore('ecg', () => {
     }
   }
 
+  /**
+   * Generate report summary from existing analysis data
+   */
+  function generateReportSummary(): ReportSummary {
+    const rPeaks = ecgData.value?.rPeaks ?? [];
+    const nnIntervals = hrvData.value?.nnIntervals ?? [];
+    const events = arrhythmiaEvents.value ?? [];
+
+    let avgRr = 0;
+    let minRr = 0;
+    let maxRr = 0;
+
+    if (nnIntervals.length > 0) {
+      avgRr = nnIntervals.reduce((a, b) => a + b, 0) / nnIntervals.length;
+      minRr = Math.min(...nnIntervals);
+      maxRr = Math.max(...nnIntervals);
+    }
+
+    const abnormalCount = events.filter(e => e.eventType !== 'normal').length;
+    const hasArrhythmia = abnormalCount > 0;
+
+    let dominantRhythm = '正常窦性心律';
+    if (hasArrhythmia) {
+      const eventTypes = events.map(e => e.eventType);
+      if (eventTypes.includes('st_elevation')) {
+        dominantRhythm = 'ST段抬高型心律';
+      } else if (eventTypes.includes('tachycardia') && eventTypes.includes('atrial_fibrillation')) {
+        dominantRhythm = '快速房颤心律';
+      } else if (eventTypes.includes('tachycardia')) {
+        dominantRhythm = '窦性心动过速';
+      } else if (eventTypes.includes('bradycardia')) {
+        dominantRhythm = '窦性心动过缓';
+      } else if (eventTypes.includes('atrial_fibrillation')) {
+        dominantRhythm = '心房颤动';
+      }
+    }
+
+    return {
+      totalBeats: rPeaks.length,
+      abnormalBeats: abnormalCount,
+      averageRr: Math.round(avgRr * 100) / 100,
+      minRr: Math.round(minRr * 100) / 100,
+      maxRr: Math.round(maxRr * 100) / 100,
+      hasArrhythmia,
+      dominantRhythm,
+    };
+  }
+
+  /**
+   * Generate waveform snapshots from ECG data
+   */
+  function generateWaveformSnapshots(count: number = 3): WaveformSnapshot[] {
+    const samples = ecgData.value?.samples ?? [];
+    const rPeaks = ecgData.value?.rPeaks ?? [];
+    const sr = samplingRate.value;
+    const dur = duration.value;
+    const lead = selectedLead.value;
+
+    if (samples.length === 0) return [];
+
+    const windowDuration = Math.min(3, dur / Math.max(1, count));
+    const windowSamples = Math.floor(windowDuration * sr);
+    const step = Math.max(1, Math.floor((samples.length - windowSamples) / Math.max(1, count - 1)));
+
+    const snapshots: WaveformSnapshot[] = [];
+
+    for (let i = 0; i < count; i++) {
+      const startIdx = Math.min(i * step, samples.length - windowSamples);
+      const endIdx = Math.min(startIdx + windowSamples, samples.length);
+
+      const sampleValues = samples.slice(startIdx, endIdx);
+      const windowRPeaks = rPeaks
+        .filter(rp => startIdx <= rp.index && rp.index < endIdx)
+        .map(rp => rp.index - startIdx);
+
+      snapshots.push({
+        leadName: lead,
+        timeRangeStart: Math.round((startIdx / sr) * 100) / 100,
+        timeRangeEnd: Math.round((endIdx / sr) * 100) / 100,
+        sampleIndices: Array.from({ length: sampleValues.length }, (_, j) => j),
+        sampleValues,
+        rPeakIndices: windowRPeaks,
+      });
+    }
+
+    return snapshots;
+  }
+
+  /**
+   * Generate medical recommendations
+   */
+  function generateRecommendations(): string[] {
+    const recommendations: string[] = [];
+    const events = arrhythmiaEvents.value ?? [];
+    const eventTypes = events.map(e => e.eventType);
+    const sdnn = hrvData.value?.sdnn ?? 0;
+
+    if (eventTypes.includes('st_elevation')) {
+      recommendations.push('⚠️ 检测到ST段抬高，提示可能存在急性心肌缺血，建议立即就医进行进一步检查。');
+      recommendations.push('建议进行心肌酶谱检测和冠状动脉造影检查。');
+    }
+
+    if (eventTypes.includes('tachycardia')) {
+      recommendations.push('📊 心率过快，建议排查是否存在贫血、甲状腺功能亢进或心功能不全。');
+      recommendations.push('建议进行24小时动态心电图监测以评估全天心率变化。');
+    }
+
+    if (eventTypes.includes('bradycardia')) {
+      recommendations.push('📊 心率过慢，建议排查是否存在窦房结功能障碍或传导阻滞。');
+      recommendations.push('如出现头晕、黑蒙等症状，建议及时就医评估是否需要起搏器治疗。');
+    }
+
+    if (eventTypes.includes('atrial_fibrillation')) {
+      recommendations.push('⚠️ 疑似心房颤动，建议进行心电图确诊并评估血栓栓塞风险。');
+      recommendations.push('建议进行超声心动图检查评估心脏结构和功能。');
+    }
+
+    if (sdnn < 20) {
+      recommendations.push('📉 HRV（SDNN）偏低，提示自主神经调节功能受损，建议关注压力管理和睡眠质量。');
+    }
+
+    if (!eventTypes.some(e => ['st_elevation', 'tachycardia', 'bradycardia', 'atrial_fibrillation'].includes(e))) {
+      recommendations.push('✅ 本次心电分析未发现明显异常，建议定期进行健康体检。');
+    }
+
+    recommendations.push('💡 本报告仅供参考，具体诊断请以专业医师意见为准。');
+
+    return recommendations;
+  }
+
+  /**
+   * Generate analysis report from existing data (frontend mode)
+   */
+  function generateReportFrontend(): AnalysisReport {
+    if (!ecgData.value || !hrvData.value) {
+      throw new Error('No ECG analysis data available');
+    }
+
+    const reportId = `ECG-${Math.random().toString(36).substring(2, 10).toUpperCase()}`;
+    const summary = generateReportSummary();
+    const snapshots = includeSnapshots.value ? generateWaveformSnapshots(snapshotCount.value) : [];
+    const recommendations = generateRecommendations();
+
+    const report: AnalysisReport = {
+      reportId,
+      generatedAt: new Date().toISOString(),
+      patientId: patientId.value || undefined,
+      lead: ecgData.value,
+      hrv: hrvData.value,
+      arrhythmiaEvents: arrhythmiaEvents.value,
+      rhythmDiagnosis: rhythmDiagnosis.value,
+      waveformSnapshots: snapshots,
+      summary,
+      recommendations,
+    };
+
+    currentReport.value = report;
+    return report;
+  }
+
+  /**
+   * Generate report using backend API
+   */
+  async function generateReportBackend(): Promise<AnalysisReport> {
+    try {
+      const response = await fetch(`${backendUrl.value}/api/report/generate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          analysis_data: {
+            lead_name: selectedLead.value,
+            duration: duration.value,
+            sampling_rate: samplingRate.value,
+            heart_rate: heartRate.value,
+          },
+          patient_id: patientId.value || undefined,
+          format: reportExportFormat.value,
+          include_snapshots: includeSnapshots.value,
+          snapshot_count: snapshotCount.value,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`Backend error: ${response.status}`);
+      }
+
+      const data = await response.json();
+      
+      const report: AnalysisReport = {
+        reportId: data.report_id,
+        generatedAt: data.generated_at,
+        patientId: data.patient_id,
+        lead: {
+          leadName: data.lead.lead_name,
+          samplingRate: data.lead.sampling_rate,
+          duration: data.lead.duration,
+          samples: data.lead.samples,
+          rPeaks: data.lead.r_peaks.map((rp: any) => ({
+            index: rp.index,
+            time: rp.time,
+            amplitude: rp.amplitude,
+          })),
+        },
+        hrv: {
+          heartRate: data.hrv.heart_rate,
+          sdnn: data.hrv.sdnn,
+          rmssd: data.hrv.rmssd,
+          pnn50: data.hrv.pnn50,
+          nnIntervals: data.hrv.nn_intervals,
+        },
+        arrhythmiaEvents: data.arrhythmia_events.map((evt: any) => ({
+          eventType: evt.event_type,
+          confidence: evt.confidence,
+          description: evt.description,
+          timestamp: evt.timestamp,
+        })),
+        rhythmDiagnosis: data.rhythm_diagnosis,
+        waveformSnapshots: data.waveform_snapshots.map((snap: any) => ({
+          leadName: snap.lead_name,
+          timeRangeStart: snap.time_range_start,
+          timeRangeEnd: snap.time_range_end,
+          imageData: snap.image_data,
+          sampleIndices: snap.sample_indices,
+          sampleValues: snap.sample_values,
+          rPeakIndices: snap.r_peak_indices,
+        })),
+        summary: {
+          totalBeats: data.summary.total_beats,
+          abnormalBeats: data.summary.abnormal_beats,
+          averageRr: data.summary.average_rr,
+          minRr: data.summary.min_rr,
+          maxRr: data.summary.max_rr,
+          hasArrhythmia: data.summary.has_arrhythmia,
+          dominantRhythm: data.summary.dominant_rhythm,
+        },
+        recommendations: data.recommendations,
+      };
+
+      currentReport.value = report;
+      return report;
+    } catch (error) {
+      console.error('Backend report generation failed:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Generate report (uses backend if enabled, otherwise frontend)
+   */
+  async function generateReport(): Promise<AnalysisReport> {
+    isGeneratingReport.value = true;
+    try {
+      if (useBackend.value) {
+        return await generateReportBackend();
+      } else {
+        return generateReportFrontend();
+      }
+    } finally {
+      isGeneratingReport.value = false;
+    }
+  }
+
+  /**
+   * Render SVG waveform for report
+   */
+  function renderSVGWaveform(
+    samples: number[],
+    rPeakIndices: number[],
+    width: number = 750,
+    height: number = 180,
+  ): string {
+    if (samples.length === 0) return '';
+
+    const minVal = Math.min(...samples);
+    const maxVal = Math.max(...samples);
+    const valRange = maxVal !== minVal ? maxVal - minVal : 1;
+
+    const padding = 20;
+    const graphWidth = width - 2 * padding;
+    const graphHeight = height - 2 * padding;
+    const xStep = graphWidth / Math.max(1, samples.length - 1);
+
+    const yMap = (val: number) => padding + graphHeight - ((val - minVal) / valRange) * graphHeight;
+
+    let pathD = '';
+    for (let i = 0; i < samples.length; i++) {
+      const x = padding + i * xStep;
+      const y = yMap(samples[i]);
+      if (i === 0) {
+        pathD += `M ${x.toFixed(2)} ${y.toFixed(2)}`;
+      } else {
+        pathD += ` L ${x.toFixed(2)} ${y.toFixed(2)}`;
+      }
+    }
+
+    let rPeakMarkers = '';
+    for (const idx of rPeakIndices) {
+      if (idx >= 0 && idx < samples.length) {
+        const x = padding + idx * xStep;
+        const y = yMap(samples[idx]);
+        rPeakMarkers += `<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="4" fill="#ef4444" />`;
+        rPeakMarkers += `<text x="${x.toFixed(2)}" y="${y - 8}" text-anchor="middle" font-size="10" fill="#ef4444">R</text>`;
+      }
+    }
+
+    let gridLines = '';
+    for (let i = 0; i < 5; i++) {
+      const yPos = padding + (i / 4) * graphHeight;
+      gridLines += `<line x1="${padding}" y1="${yPos}" x2="${width - padding}" y2="${yPos}" stroke="rgba(16, 185, 129, 0.1)" stroke-width="1" />`;
+    }
+
+    return `<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">
+      <rect width="${width}" height="${height}" fill="#0a0a0a" />
+      ${gridLines}
+      <path d="${pathD}" stroke="#10b981" stroke-width="1.5" fill="none" />
+      ${rPeakMarkers}
+    </svg>`;
+  }
+
+  /**
+   * Generate HTML report content
+   */
+  function generateHTMLReport(report: AnalysisReport): string {
+    const snapshotSVGs = report.waveformSnapshots.map((snap, i) => ({
+      index: i + 1,
+      snapshot: snap,
+      svg: renderSVGWaveform(snap.sampleValues, snap.rPeakIndices, 750, 180),
+    }));
+
+    const arrhythmiaHTML = report.arrhythmiaEvents.map(event => {
+      const colors: Record<string, string> = {
+        normal: '#10b981',
+        tachycardia: '#ef4444',
+        bradycardia: '#f59e0b',
+        st_elevation: '#f97316',
+        atrial_fibrillation: '#a855f7',
+        premature_ventricular_contraction: '#ec4899',
+      };
+      const color = colors[event.eventType] || '#6b7280';
+      const eventLabel = event.eventType.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+
+      return `<div style="border-left: 4px solid ${color}; padding: 12px; margin: 8px 0; background: #1f2937; border-radius: 0 8px 8px 0;">
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+          <strong style="color: ${color};">${eventLabel}</strong>
+          <span style="color: #9ca3af; font-size: 12px;">置信度: ${(event.confidence * 100).toFixed(0)}%</span>
+        </div>
+        <p style="color: #d1d5db; margin: 4px 0; font-size: 14px;">${event.description}</p>
+        <p style="color: #6b7280; font-size: 12px;">时间: ${event.timestamp.toFixed(2)}s</p>
+      </div>`;
+    }).join('');
+
+    const recommendationsHTML = report.recommendations
+      .map(rec => `<li style="color: #d1d5db; margin: 8px 0; font-size: 14px;">${rec}</li>`)
+      .join('');
+
+    const snapshotsHTML = snapshotSVGs.map(({ index, snapshot, svg }) => `
+      <div style="margin: 16px 0;">
+        <h4 style="color: #10b981; margin-bottom: 8px;">截图 ${index}: ${snapshot.timeRangeStart.toFixed(1)}s - ${snapshot.timeRangeEnd.toFixed(1)}s</h4>
+        ${svg}
+      </div>
+    `).join('');
+
+    const generatedDate = new Date(report.generatedAt);
+    const abnormalColor = report.summary.abnormalBeats > 0 ? '#ef4444' : '#10b981';
+
+    return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>心电分析报告 - ${report.reportId}</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #030712; color: #e5e7eb; margin: 0; padding: 20px; }
+    .report-container { max-width: 900px; margin: 0 auto; background: #111827; border-radius: 12px; padding: 32px; box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5); }
+    .header { border-bottom: 2px solid #10b981; padding-bottom: 20px; margin-bottom: 24px; }
+    h1 { color: #10b981; margin: 0 0 8px 0; font-size: 28px; }
+    h2 { color: #06b6d4; margin: 24px 0 12px 0; font-size: 20px; border-bottom: 1px solid #374151; padding-bottom: 8px; }
+    .meta-info { display: flex; flex-wrap: wrap; gap: 16px; color: #9ca3af; font-size: 14px; }
+    .meta-info span { background: #1f2937; padding: 6px 12px; border-radius: 6px; }
+    .diagnosis-box { background: linear-gradient(135deg, #064e3b 0%, #065f46 100%); border: 1px solid #10b981; border-radius: 8px; padding: 20px; margin: 16px 0; }
+    .diagnosis-text { color: #34d399; font-size: 18px; font-weight: 600; }
+    .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin: 16px 0; }
+    .metric-card { background: #1f2937; border: 1px solid #374151; border-radius: 8px; padding: 16px; text-align: center; }
+    .metric-label { color: #9ca3af; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+    .metric-value { color: #06b6d4; font-size: 28px; font-weight: 700; margin: 4px 0; }
+    .metric-unit { color: #6b7280; font-size: 12px; }
+    .summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 16px 0; }
+    .summary-item { background: #1f2937; padding: 12px; border-radius: 6px; text-align: center; }
+    .summary-label { color: #9ca3af; font-size: 12px; }
+    .summary-value { color: #f59e0b; font-size: 18px; font-weight: 600; }
+    .footer { margin-top: 32px; padding-top: 16px; border-top: 1px solid #374151; text-align: center; color: #6b7280; font-size: 12px; }
+    @media print { body { background: white; padding: 0; } .report-container { box-shadow: none; border: 1px solid #e5e7eb; } }
+  </style>
+</head>
+<body>
+  <div class="report-container">
+    <div class="header">
+      <h1>❤️ 心电分析报告</h1>
+      <div class="meta-info">
+        <span>报告编号: ${report.reportId}</span>
+        <span>生成时间: ${generatedDate.toLocaleString('zh-CN')}</span>
+        <span>导联: ${report.lead.leadName}</span>
+        <span>时长: ${report.lead.duration}s</span>
+        ${report.patientId ? `<span>患者ID: ${report.patientId}</span>` : ''}
+      </div>
+    </div>
+
+    <div class="diagnosis-box">
+      <div class="diagnosis-text">诊断结论: ${report.rhythmDiagnosis}</div>
+    </div>
+
+    <h2>📊 心率变异性 (HRV) 指标</h2>
+    <div class="metrics-grid">
+      <div class="metric-card"><div class="metric-label">心率</div><div class="metric-value">${report.hrv.heartRate.toFixed(1)}</div><div class="metric-unit">BPM</div></div>
+      <div class="metric-card"><div class="metric-label">SDNN</div><div class="metric-value">${report.hrv.sdnn.toFixed(1)}</div><div class="metric-unit">ms</div></div>
+      <div class="metric-card"><div class="metric-label">RMSSD</div><div class="metric-value">${report.hrv.rmssd.toFixed(1)}</div><div class="metric-unit">ms</div></div>
+      <div class="metric-card"><div class="metric-label">pNN50</div><div class="metric-value">${report.hrv.pnn50.toFixed(1)}</div><div class="metric-unit">%</div></div>
+    </div>
+
+    <h2>📋 分析摘要</h2>
+    <div class="summary-grid">
+      <div class="summary-item"><div class="summary-label">总心跳数</div><div class="summary-value">${report.summary.totalBeats}</div></div>
+      <div class="summary-item"><div class="summary-label">异常心跳</div><div class="summary-value" style="color: ${abnormalColor};">${report.summary.abnormalBeats}</div></div>
+      <div class="summary-item"><div class="summary-label">平均RR</div><div class="summary-value">${report.summary.averageRr.toFixed(0)} ms</div></div>
+      <div class="summary-item"><div class="summary-label">最小RR</div><div class="summary-value">${report.summary.minRr.toFixed(0)} ms</div></div>
+      <div class="summary-item"><div class="summary-label">最大RR</div><div class="summary-value">${report.summary.maxRr.toFixed(0)} ms</div></div>
+      <div class="summary-item"><div class="summary-label">主导心律</div><div class="summary-value" style="font-size: 14px;">${report.summary.dominantRhythm}</div></div>
+    </div>
+
+    <h2>⚠️ 心律失常事件</h2>
+    ${report.arrhythmiaEvents.length > 0 ? arrhythmiaHTML : '<p style="color: #9ca3af;">未检测到明显心律失常事件。</p>'}
+
+    <h2>📈 波形截图</h2>
+    ${report.waveformSnapshots.length > 0 ? snapshotsHTML : '<p style="color: #9ca3af;">未包含波形截图。</p>'}
+
+    <h2>💡 医疗建议</h2>
+    <ul style="padding-left: 20px;">${recommendationsHTML}</ul>
+
+    <div class="footer">
+      <p>本报告由 ECG 监测系统自动生成 | 报告编号: ${report.reportId}</p>
+      <p>⚠️ 本报告仅供参考，不作为最终诊断依据，请以专业医师意见为准。</p>
+    </div>
+  </div>
+</body>
+</html>`;
+  }
+
+  /**
+   * Download report as file
+   */
+  function downloadReport(report: AnalysisReport, format: ReportFormat): void {
+    const timestamp = new Date(report.generatedAt).toISOString().replace(/[-:.]/g, '').slice(0, 15);
+    const filename = `ECG_Report_${report.reportId}_${timestamp}`;
+
+    if (format === 'html') {
+      const htmlContent = generateHTMLReport(report);
+      const blob = new Blob([htmlContent], { type: 'text/html;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${filename}.html`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } else {
+      const htmlContent = generateHTMLReport(report);
+      const printWindow = window.open('', '_blank');
+      if (printWindow) {
+        printWindow.document.write(htmlContent);
+        printWindow.document.close();
+        printWindow.onload = () => {
+          setTimeout(() => {
+            printWindow.print();
+          }, 500);
+        };
+      }
+    }
+  }
+
+  /**
+   * Preview report in new tab
+   */
+  function previewReport(report: AnalysisReport): void {
+    const htmlContent = generateHTMLReport(report);
+    const previewWindow = window.open('', '_blank');
+    if (previewWindow) {
+      previewWindow.document.write(htmlContent);
+      previewWindow.document.close();
+    }
+  }
+
+  /**
+   * Export report (uses backend if enabled)
+   */
+  async function exportReport(): Promise<void> {
+    if (!currentReport.value) {
+      await generateReport();
+    }
+
+    if (!currentReport.value) {
+      throw new Error('Failed to generate report');
+    }
+
+    isExportingReport.value = true;
+    try {
+      if (useBackend.value) {
+        try {
+          const response = await fetch(`${backendUrl.value}/api/report/export`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              analysis_data: {
+                lead_name: selectedLead.value,
+                duration: duration.value,
+                sampling_rate: samplingRate.value,
+                heart_rate: heartRate.value,
+              },
+              patient_id: patientId.value || undefined,
+              format: reportExportFormat.value,
+              include_snapshots: includeSnapshots.value,
+              snapshot_count: snapshotCount.value,
+            }),
+          });
+
+          if (response.ok) {
+            const data: ReportExportResponse = await response.json();
+            if (data.content) {
+              const blob = reportExportFormat.value === 'html'
+                ? new Blob([data.content], { type: 'text/html;charset=utf-8' })
+                : new Blob([Uint8Array.from(atob(data.content), c => c.charCodeAt(0))], { type: 'application/pdf' });
+              
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement('a');
+              a.href = url;
+              a.download = data.filename;
+              document.body.appendChild(a);
+              a.click();
+              document.body.removeChild(a);
+              URL.revokeObjectURL(url);
+              return;
+            }
+          }
+        } catch (error) {
+          console.warn('Backend export failed, falling back to frontend:', error);
+        }
+      }
+
+      downloadReport(currentReport.value, reportExportFormat.value);
+    } finally {
+      isExportingReport.value = false;
+    }
+  }
+
   return {
     // State
     selectedLead,
@@ -395,10 +963,19 @@ export const useECGStore = defineStore('ecg', () => {
     useBackend,
     backendUrl,
     scrollOffset,
+    // Report state
+    currentReport,
+    reportExportFormat,
+    includeSnapshots,
+    snapshotCount,
+    patientId,
+    isGeneratingReport,
+    isExportingReport,
     // Getters
     currentSamples,
     currentRPeaks,
     currentHeartRate,
+    hasAnalysisData,
     // Actions
     analyzeECG,
     startMonitoring,
@@ -409,5 +986,17 @@ export const useECGStore = defineStore('ecg', () => {
     detectRPeaks,
     calculateHRV,
     detectArrhythmias,
+    // Report actions
+    generateReport,
+    generateReportFrontend,
+    generateReportBackend,
+    generateReportSummary,
+    generateWaveformSnapshots,
+    generateRecommendations,
+    generateHTMLReport,
+    renderSVGWaveform,
+    downloadReport,
+    previewReport,
+    exportReport,
   };
 });

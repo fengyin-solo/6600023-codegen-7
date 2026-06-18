@@ -80,8 +80,13 @@
         <p class="text-xs text-gray-500 mt-1 ml-6">连接 FastAPI 后端分析服务</p>
       </div>
 
+      <!-- Report Generator -->
+      <div class="mb-5">
+        <ReportGenerator />
+      </div>
+
       <!-- Control Buttons -->
-      <div class="space-y-2 mt-auto">
+      <div class="space-y-2">
         <button
           @click="store.startMonitoring"
           :disabled="store.isMonitoring"
@@ -229,6 +234,7 @@ import { computed, onMounted, onUnmounted } from 'vue';
 import { useECGStore } from './store/ecg';
 import ECGWaveform from './components/ECGWaveform.vue';
 import HRVAnalysis from './components/HRVAnalysis.vue';
+import ReportGenerator from './components/ReportGenerator.vue';
 import { LEAD_NAMES } from './types';
 
 const store = useECGStore();
